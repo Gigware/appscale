@@ -147,6 +147,15 @@ def add_routing(app, port):
     app: A string that contains the application ID.
     port: A string that contains the port that the AppServer listens on.
   """
+  logging.info("Waiting for application {} on port {} to be active.".
+    format(str(app), str(port)))
+  if not wait_on_app(port):
+    # In case the AppServer fails we let the AppController to detect it
+    # and remove it if it still show in monit.
+    logging.warning("AppServer did not come up in time, for {}:{}.".
+      format(str(app), str(port)))
+    return
+
   acc = appscale_info.get_appcontroller_client()
   appserver_ip = appscale_info.get_private_ip()
 
@@ -160,17 +169,6 @@ def add_routing(app, port):
 
   logging.info('Successfully established routing for {} on port {}'.
     format(app, port))
-
-def remove_routing(app, port):
-  """ Tells the AppController to stop routing traffic to an AppServer.
-
-  Args:
-    app: A string that contains the application ID.
-    port: A string that contains the port that the AppServer listens on.
-  """
-  acc = appscale_info.get_appcontroller_client()
-  appserver_ip = appscale_info.get_private_ip()
-  acc.remove_appserver_from_haproxy(app, appserver_ip, port)
 
 def start_app(config):
   """ Starts a Google App Engine application on this machine. It
@@ -207,6 +205,7 @@ def start_app(config):
   env_vars['GOPATH'] = '/root/appscale/AppServer/gopath/'
   env_vars['GOROOT'] = '/root/appscale/AppServer/goroot/'
   watch = "app___" + config['app_name']
+  match_cmd = ""
 
   if config['language'] == constants.PYTHON27 or \
       config['language'] == constants.GO or \
@@ -238,6 +237,9 @@ def start_app(config):
       config['load_balancer_ip'],
       max_heap
     )
+    match_cmd = "java -ea -cp.*--port={}.*{}".format(str(config['app_port']),
+      os.path.dirname(locate_dir("/var/apps/" + config['app_name'] + "/app/",
+      "WEB-INF")))
 
     stop_cmd = create_java_stop_cmd(config['app_port'])
     env_vars.update(create_java_app_env(config['app_name']))
@@ -262,18 +264,20 @@ def start_app(config):
     env_vars,
     config['max_memory'],
     syslog_server,
-    appscale_info.get_private_ip())
+    appscale_info.get_private_ip(),
+    match_cmd=match_cmd)
 
-  if not monit_interface.start(watch):
-    logging.error("Unable to start application server with monit")
+  # We want to tell monit to start the single process instead of the
+  # group, since monit can get slow if there are quite a few processes in
+  # the same group.
+  full_watch = "{}-{}".format(str(watch), str(config['app_port']))
+  if not monit_interface.start(full_watch, is_group=False):
+    logging.warning("Monit was unable to start {}:{}".
+      format(str(config['app_name']), config['app_port']))
     return BAD_PID
 
-  if not wait_on_app(int(config['app_port'])):
-    logging.error("Application server did not come up in time, "
-      "removing monit watch")
-    monit_interface.stop(watch)
-    return BAD_PID
-
+  # Since we are going to wait, possibly for a long time for the
+  # application to be ready, we do it in a thread.
   threading.Thread(target=add_routing,
     args=(config['app_name'], config['app_port'])).start()
 
@@ -288,7 +292,6 @@ def start_app(config):
   if not setup_logrotate(config['app_name'], watch, log_size):
     logging.error("Error while setting up log rotation for application: {}".
       format(config['app_name']))
-
 
   return 0
 
@@ -342,9 +345,6 @@ def stop_app_instance(app_name, port):
       "invalid name for application" % (app_name, int(port)))
     return False
 
-  logging.info('Removing routing for {} on port {}'.format(app_name, port))
-  remove_routing(app_name, port)
-
   logging.info("Stopping application %s" % app_name)
   watch = "app___" + app_name + "-" + str(port)
   if not monit_interface.stop(watch, is_group=False):
@@ -362,25 +362,6 @@ def stop_app_instance(app_name, port):
 
   return True
 
-def restart_app_instances_for_app(app_name, language):
-  """ Restarts all instances of a Google App Engine application on this machine.
-
-  Args:
-    app_name: The application ID corresponding to the app to restart.
-    language: The language the application is written in.
-  Returns:
-    True if successful, and False otherwise.
-  """
-  if not misc.is_app_name_valid(app_name):
-    logging.error("Unable to kill app process %s on because of " \
-      "invalid name for application" % (app_name))
-    return False
-  if language == "java":
-    remove_conflicting_jars(app_name)
-    copy_modified_jars(app_name)
-  logging.info("Restarting application %s" % app_name)
-  watch = "app___" + app_name
-  return monit_interface.restart(watch)
 
 def stop_app(app_name):
   """ Stops all process instances of a Google App Engine application on this
@@ -726,6 +707,7 @@ def create_java_start_cmd(app_name, port, load_balancer_host, max_heap):
     "--jvm_flag=-Dsocket.permit_connect=true",
     "--jvm_flag=-Dhttps.protocols=TLSv1.1,TLSv1.2",
     '--jvm_flag=-Xmx{}m'.format(max_heap),
+    '--jvm_flag=-Djava.security.egd=file:/dev/./urandom',
     "--disable_update_check",
     "--address=" + appscale_info.get_private_ip(),
     "--datastore_path=" + db_location,
@@ -734,7 +716,7 @@ def create_java_start_cmd(app_name, port, load_balancer_host, max_heap):
     "--APP_NAME=" + app_name,
     "--NGINX_ADDRESS=" + load_balancer_host,
     "--NGINX_PORT=anything",
-    os.path.dirname(locate_dir("/var/apps/" + app_name +"/app/", "WEB-INF"))
+    os.path.dirname(locate_dir("/var/apps/" + app_name + "/app/", "WEB-INF"))
   ]
 
   return ' '.join(cmd)
@@ -801,7 +783,6 @@ if __name__ == "__main__":
   SERVER.registerFunction(start_app)
   SERVER.registerFunction(stop_app)
   SERVER.registerFunction(stop_app_instance)
-  SERVER.registerFunction(restart_app_instances_for_app)
 
   while 1:
     try:

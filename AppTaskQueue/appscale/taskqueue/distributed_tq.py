@@ -170,9 +170,6 @@ class DistributedTaskQueue():
   # Required stop worker name tags.
   STOP_WORKERS_TAGS = ['app_id']
 
-  # Autoscale argument for max/min concurrency for a celery worker.
-  MIN_MAX_CONCURRENCY = "10,1"
-
   # The location of where celery logs go.
   LOG_DIR = "/var/log/appscale/celery_workers/"
 
@@ -209,6 +206,9 @@ class DistributedTaskQueue():
 
   # A dict that tells celery to run tasks even though we are running as root.
   CELERY_ENV_VARS = {"C_FORCE_ROOT" : True}
+
+  # The max memory allocated to celery worker pools in MB.
+  CELERY_MAX_MEMORY = 1000
 
   def __init__(self, db_access):
     """ DistributedTaskQueue Constructor.
@@ -432,7 +432,7 @@ class DistributedTaskQueue():
                "--time-limit=" + str(self.HARD_TIME_LIMIT),
                "--autoscale={max},{min}".format(
                  max=TaskQueueConfig.MAX_CELERY_CONCURRENCY,
-                 min=TaskQueueConfig.MIN_CELERY_CONCURRENTY),
+                 min=TaskQueueConfig.MIN_CELERY_CONCURRENCY),
                "--soft-time-limit=" + str(self.TASK_SOFT_TIME_LIMIT),
                "--pidfile=" + self.PID_FILE_LOC + 'celery___' + \
                              app_id + ".pid",
@@ -446,6 +446,7 @@ class DistributedTaskQueue():
                                                start_command, 
                                                stop_command, 
                                                [self.CELERY_PORT],
+                                               max_memory=self.CELERY_MAX_MEMORY,
                                                env_vars=self.CELERY_ENV_VARS)
     if monit_interface.start(watch):
       json_response = {'error': False}
@@ -463,17 +464,34 @@ class DistributedTaskQueue():
     Returns:
       A tuple of a encoded response, error code, and error detail.
     """
-    request = taskqueue_service_pb.\
-      TaskQueueFetchQueueStatsRequest(http_data)
-    response = taskqueue_service_pb.\
-      TaskQueueFetchQueueStatsResponse()
-    for queue in request.queue_name_list():
+    epoch = datetime.datetime.utcfromtimestamp(0)
+    request = taskqueue_service_pb.TaskQueueFetchQueueStatsRequest(http_data)
+    response = taskqueue_service_pb.TaskQueueFetchQueueStatsResponse()
+
+    for queue_name in request.queue_name_list():
+      queue = self.get_queue(app_id, queue_name)
       stats_response = response.add_queuestats()
-      count = TaskName.all().filter("state =", tq_lib.TASK_STATES.QUEUED).\
-        filter("queue =", queue).filter("app_id =", app_id).count()
-      stats_response.set_num_tasks(count)
-      stats_response.set_oldest_eta_usec(-1)
-    return (response.Encode(), 0, "")
+
+      if isinstance(queue, PullQueue):
+        num_tasks = queue.total_tasks()
+        oldest_eta = queue.oldest_eta()
+      else:
+        num_tasks = TaskName.all().\
+          filter("state =", tq_lib.TASK_STATES.QUEUED).\
+          filter("queue =", queue_name).\
+          filter("app_id =", app_id).count()
+
+        # This is not supported for push queues yet.
+        oldest_eta = None
+
+      # -1 is used to indicate an absence of a value.
+      oldest_eta_usec = (int((oldest_eta - epoch).total_seconds() * 1000000)
+                         if oldest_eta else -1)
+
+      stats_response.set_num_tasks(num_tasks)
+      stats_response.set_oldest_eta_usec(oldest_eta_usec)
+
+    return response.Encode(), 0, ""
 
   def purge_queue(self, app_id, http_data):
     """ 
